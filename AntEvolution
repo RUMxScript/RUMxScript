@@ -1,0 +1,923 @@
+--[[
+ RUM ANT V3 - UI Key Hub API AddToggle / AddDropdown / AddSlider / AddButton
+ PlaceId: 123969755970816. Built against client-visible scanner snapshot, 18 Nov 2026.
+
+ Runtime modules actually implemented without private API knowledge:
+   1. Live Stage/Kills/Rebirths monitor
+   2. Orb tracker, humanoid-based WALK to Orb candidate (not guaranteed pickup)
+   3. Nearby Critter observations, low-HP alerts
+   4. Lost Eggs tracker and WALK to each unvisited egg
+   5. Gate tracker and WALK to a selected gate
+ Additional game actions require an AUTHORIZED full adapter (Read/Plan/Snapshot/Execute/Verify).
+
+ The game-specific collection/bite/upgrade/quest/pet/mutation Remote protocol has NOT
+ been observed. This file does not guess remote payloads or claim Auto Play completion.
+
+ Shared Key Hub UI MUST expose UI.AddToggle, UI.AddDropdown, UI.AddSlider,
+ UI.AddButton. It already owns Home / Tinh nang / Player / Settings, so this
+ file never calls CreateWindow/CreateTab or modifies RUMScript_UI.lua.
+
+ Movement control starts OFF, is opt-in, uses Humanoid:MoveTo (no teleport).
+ Controller:Stop() or F8 is emergency stop. Never claim tested in Delta/Roblox.
+]]
+
+local Players = game:GetService('Players')
+local Workspace = game:GetService('Workspace')
+local UserInputService = game:GetService('UserInputService')
+local PathfindingService = game:GetService('PathfindingService')
+
+local player = Players.LocalPlayer
+if not player then
+    warn('[RUM] Client-only script. Run in StarterPlayerScripts / client Play Test.')
+    return
+end
+
+local CONFIG = {
+    PlaceId = 123969755970816,
+    RequireMatchingPlaceId = true,
+    TickSeconds = 1.5,
+    ReportSeconds = 18,
+    MaxErrorCount = 3,
+    MaxOrbDistance = 100,
+    MaxCritterDistance = 110,
+    MaxEggDistance = 300,
+    LowHealthRatio = 0.25,
+    MaxTravelDistance = 180,
+    MaxMoveSeconds = 25,
+    EmergencyStopKey = Enum.KeyCode.F8,
+
+    -- All gameplay-changing actions are OFF until the game-specific contract is verified.
+    EnableActions = false, -- only for a fully authorized, verified game adapter
+    EnableMovement = false, -- only for local Humanoid:MoveTo, opt in deliberately
+    TargetZoneGate = 'Gate_Garden',
+    UseBasicPathfinding = true,
+    ActionCooldown = 4,
+    AllowRebirth = false,
+    AllowResourceSpending = false,
+    MaxActionsPerSession = 100,
+    MaxSpendActionsPerSession = 10,
+
+    Features = {
+        progression_watch    = true,
+        orb_tracker          = true,
+        orb_auto_collect     = false,
+        combat_target_hint   = true,
+        combat_auto_bite     = false,
+        ability_scheduler    = false,
+        combat_retreat       = true,
+        quest_helper         = true,
+        daily_claim          = false,
+        lost_egg_tracker     = true,
+        lost_egg_auto_visit  = false, -- walk to egg, not guaranteed collection
+        upgrade_advisor      = true,
+        upgrade_autobuy      = false,
+        evolve_assistant     = true,
+        evolve_auto          = false,
+        pet_manager          = true,
+        pet_hatch_fuse       = false,
+        mutation_manager     = true,
+        mutation_automatic   = false,
+        zone_navigation      = false,
+        rebirth_advisor      = true,
+        rebirth_automatic    = false,
+        event_assistant      = true,
+        all_game_autoplay    = false, -- group D: impossible to validate from snapshot
+    },
+}
+
+local Adapter = {} -- Implement the five ADAPTER CONTRACT methods here, if authorized.
+local env = _G
+if type(getgenv) == 'function' then
+    local ok, result = pcall(getgenv)
+    if ok and type(result) == 'table' then env = result end
+end
+if type(env.RUM_AUTHORIZED_ADAPTER) == 'table' then
+    Adapter = env.RUM_AUTHORIZED_ADAPTER
+end
+
+if CONFIG.RequireMatchingPlaceId and game.PlaceId ~= CONFIG.PlaceId then
+    warn(('[RUM] Wrong PlaceId: %s != %s. Stop.'):format(tostring(game.PlaceId), tostring(CONFIG.PlaceId)))
+    return
+end
+
+if env.RUM_CONTROLLER and type(env.RUM_CONTROLLER.Stop) == 'function' then
+    pcall(function() env.RUM_CONTROLLER:Stop('Replaced by new session') end)
+end
+
+local controller = {
+    Running = true,
+    Config = CONFIG,
+    Statistics = { ticks = 0, actions = 0, verified = 0, failed = 0, walks = 0, spendActions = 0 },
+    Last = {},
+    Cache = {},
+    SeenEggs = {},
+    SeenOrbs = setmetatable({}, {__mode = 'k'}), -- visited locally, NOT claimed
+    WalkTarget = nil,
+    Blocked = {},
+    Errors = {},
+    Connections = {},
+    LastActionAt = {},
+}
+env.RUM_CONTROLLER = controller
+
+local function say(level, fmt, ...)
+    local msg = ('[RUM][%s] ' .. fmt):format(level, ...)
+    if level == 'ERROR' then warn(msg) else print(msg) end
+end
+
+local function logChange(key, value, fmt, ...)
+    if controller.Last[key] == value then return end
+    controller.Last[key] = value
+    say('INFO', fmt, ...)
+end
+
+local function featureOn(name)
+    return controller.Running and CONFIG.Features[name] == true and not controller.Blocked[name]
+end
+
+local function attempt(label, fn, ...)
+    local ok, a, b, c = pcall(fn, ...)
+    if not ok then
+        controller.Errors[label] = (controller.Errors[label] or 0) + 1
+        if controller.Errors[label] <= CONFIG.MaxErrorCount then
+            say('ERROR', '%s: %s', label, tostring(a))
+        end
+        if controller.Errors[label] >= CONFIG.MaxErrorCount then
+            controller.Blocked[label] = true
+            say('WARN', '%s disabled after repeated errors', label)
+        end
+        return nil
+    end
+    return a, b, c
+end
+
+local function find(root, path)
+    local current = root
+    for segment in string.gmatch(path, '[^%.]+') do
+        if not current then return nil end
+        current = current:FindFirstChild(segment)
+    end
+    return current
+end
+
+local function positionOf(object)
+    if not object or typeof(object) ~= 'Instance' then return nil end
+    if object:IsA('BasePart') then return object.Position end
+    if object:IsA('Model') then
+        local base = object.PrimaryPart or object:FindFirstChild('HumanoidRootPart')
+        if base and base:IsA('BasePart') then return base.Position end
+        local ok, cf = pcall(function() return object:GetPivot() end)
+        if ok then return cf.Position end
+    end
+    return nil
+end
+
+local function characterState()
+    local character = player.Character
+    if not character then return nil end
+    local root = character:FindFirstChild('HumanoidRootPart') or character.PrimaryPart
+    local humanoid = character:FindFirstChildOfClass('Humanoid')
+    if not root or not root:IsA('BasePart') then return nil end
+    local hp, maxHp = nil, nil
+    if humanoid then hp, maxHp = humanoid.Health, humanoid.MaxHealth end
+    return {
+        Character = character, Root = root, Humanoid = humanoid,
+        Position = root.Position, Health = hp, MaxHealth = maxHp,
+        Alive = hp == nil or hp > 0,
+    }
+end
+
+local function progress()
+    local stats = player:FindFirstChild('leaderstats')
+    local result = {}
+    if not stats then return result end
+    for _, name in ipairs({'Stage', 'Kills', 'Rebirths'}) do
+        local value = stats:FindFirstChild(name)
+        if value and value:IsA('ValueBase') then result[name] = value.Value end
+    end
+    return result
+end
+
+local nextInstanceId = 0
+local instanceIds = setmetatable({}, {__mode = 'k'})
+local function uniqueId(inst)
+    if not instanceIds[inst] then
+        nextInstanceId += 1
+        instanceIds[inst] = ('s%s:%s'):format(tostring(nextInstanceId), inst.Name)
+    end
+    return instanceIds[inst]
+end
+
+local function scanNearest(folder, origin, maximum, predicate)
+    if not folder or not origin then return nil, math.huge, 0 end
+    local closest, distance, count = nil, math.huge, 0
+    for _, child in ipairs(folder:GetChildren()) do
+        if not predicate or predicate(child) then
+            local pos = positionOf(child)
+            if pos then
+                count += 1
+                local d = (pos - origin).Magnitude
+                if d < distance and d <= maximum then
+                    distance, closest = d, child
+                end
+            end
+        end
+    end
+    return closest, distance, count
+end
+
+local function orbFolder()
+    return Workspace:FindFirstChild('ClientOrbs')
+end
+local function critterFolder()
+    return find(Workspace, 'Ants.Critters')
+end
+local function eggFolder()
+    return find(Workspace, 'Game.LostEggs')
+end
+local function gateFolder()
+    return find(Workspace, 'Game.Gates')
+end
+
+local function readAdapter(name, state)
+    if type(Adapter.Read) ~= 'function' then return nil end
+    return attempt('Adapter.Read.' .. name, function() return Adapter:Read(name, state) end)
+end
+
+local function isSpending(feature)
+    return feature == 'upgrade_autobuy' or feature == 'pet_hatch_fuse'
+        or feature == 'mutation_automatic' or feature == 'rebirth_automatic'
+end
+
+local function canPerform(feature)
+    if not featureOn(feature) or not CONFIG.EnableActions then return false end
+    if controller.Statistics.actions >= CONFIG.MaxActionsPerSession then return false end
+    if isSpending(feature) then
+        if not CONFIG.AllowResourceSpending then return false end
+        if controller.Statistics.spendActions >= CONFIG.MaxSpendActionsPerSession then return false end
+    end
+    if feature == 'rebirth_automatic' and not CONFIG.AllowRebirth then return false end
+    if os.clock() - (controller.LastActionAt[feature] or -1e9) < CONFIG.ActionCooldown then
+        return false
+    end
+    return true
+end
+
+local function hasFullAdapter()
+    for _, name in ipairs({'Read','Plan','Snapshot','Execute','Verify'}) do
+        if type(Adapter[name]) ~= 'function' then return false end
+    end
+    return true
+end
+
+-- Executable gameplay actions require a complete, authorized, verified adapter.
+-- If Snapshot/Verify cannot prove the result, feature is NOT counted as success.
+local function adapterAction(feature, state)
+    if not canPerform(feature) or not hasFullAdapter() then return false end
+    local payload = attempt('Adapter.Plan.' .. feature,
+        function() return Adapter:Plan(feature, state, controller) end)
+    if payload == nil or payload == false then return false end
+    local before = attempt('Adapter.Snapshot.' .. feature,
+        function() return Adapter:Snapshot(feature, payload, controller) end)
+    if before == nil then return false end
+    controller.LastActionAt[feature] = os.clock()
+    controller.Statistics.actions += 1
+    if isSpending(feature) then controller.Statistics.spendActions += 1 end
+    local executed, message = attempt('Adapter.Execute.' .. feature,
+        function() return Adapter:Execute(feature, payload, controller) end)
+    if not controller.Running then return false end
+    if executed ~= true then
+        controller.Statistics.failed += 1
+        say('WARN', '%s not executed: %s', feature, tostring(message or 'unknown'))
+        return true -- an action WAS attempted; do not run another one in the same tick
+    end
+    task.wait(0.3)
+    local after = attempt('Adapter.Snapshot.' .. feature,
+        function() return Adapter:Snapshot(feature, payload, controller) end)
+    if after == nil then
+        controller.Statistics.failed += 1
+        say('WARN', '%s: no post-action snapshot', feature)
+        return true -- attempted, unverified
+    end
+    local verified, note = attempt('Adapter.Verify.' .. feature,
+        function() return Adapter:Verify(feature, payload, before, after, controller) end)
+    if verified == true then
+        controller.Statistics.verified += 1
+        say('OK', '%s confirmed: %s', feature, tostring(note or 'state change validated'))
+        return true
+    end
+    controller.Statistics.failed += 1
+    say('WARN', '%s UNVERIFIED: %s', feature, tostring(note or 'unknown'))
+    return true -- attempted, unverified
+end
+
+-- Movement (walk only). Never teleports, never changes CFrame or bypasses game gates.
+local function walkTo(targetPosition, feature)
+    local char = characterState()
+    if not char or not char.Alive or not char.Humanoid then return false, 'No controllable humanoid' end
+    if typeof(targetPosition) ~= 'Vector3' then return false, 'Invalid target position' end
+    if (targetPosition - char.Position).Magnitude > CONFIG.MaxTravelDistance then
+        return false, 'Target farther than MaxTravelDistance'
+    end
+
+    local waypoints = {targetPosition}
+    if CONFIG.UseBasicPathfinding then
+        local path = PathfindingService:CreatePath({AgentCanJump = true})
+        local ok = pcall(function() path:ComputeAsync(char.Position, targetPosition) end)
+        if ok and path.Status == Enum.PathStatus.Success then
+            waypoints = {}
+            for _, waypoint in ipairs(path:GetWaypoints()) do
+                table.insert(waypoints, waypoint)
+            end
+        end
+    end
+
+    local deadline = os.clock() + CONFIG.MaxMoveSeconds
+    for _, waypoint in ipairs(waypoints) do
+        if not controller.Running or not CONFIG.EnableMovement or not featureOn(feature) then return false, 'Stopped/toggled off' end
+        local point = typeof(waypoint) == 'Vector3' and waypoint or waypoint.Position
+        if typeof(waypoint) ~= 'Vector3' and waypoint.Action == Enum.PathWaypointAction.Jump then
+            char.Humanoid.Jump = true
+        end
+        char.Humanoid:MoveTo(point)
+        local reached = false
+        repeat
+            task.wait(0.12)
+            if not controller.Running or not CONFIG.EnableMovement or not featureOn(feature) then return false, 'Stopped/toggled off' end
+            local current = characterState()
+            if not current or not current.Alive then return false, 'Character lost' end
+            reached = (current.Position - point).Magnitude <= 4.5
+        until reached or os.clock() >= deadline
+        if not reached then return false, 'Move timeout' end
+    end
+    return true
+end
+
+-- Movement is a real, local Roblox Humanoid action. It is NOT proof of pickup.
+local function canWalk(feature)
+    if not controller.Running or not CONFIG.EnableMovement or not featureOn(feature) then return false end
+    if controller.Statistics.actions >= CONFIG.MaxActionsPerSession then return false end
+    if os.clock() - (controller.LastActionAt[feature] or -1e9) < CONFIG.ActionCooldown then return false end
+    return true
+end
+
+local function walkCandidate(feature, target, label)
+    if not canWalk(feature) or not target or not target:IsDescendantOf(Workspace) then return false end
+    local targetPosition = positionOf(target)
+    local cs = characterState()
+    if not cs or not cs.Alive or not targetPosition then return false end
+    local distance = (targetPosition - cs.Position).Magnitude
+    if distance <= 5 then return false end
+    if distance > CONFIG.MaxTravelDistance then
+        logChange('far:' .. feature, uniqueId(target), '%s too far (%.1f studs); max walk distance %d',
+            label, distance, CONFIG.MaxTravelDistance)
+        return false
+    end
+    controller.LastActionAt[feature] = os.clock()
+    controller.Statistics.actions += 1
+    controller.WalkTarget = target
+    say('INFO', '%s: walking to %s, %.1f studs', feature, label, distance)
+    local ok, note = walkTo(targetPosition, feature)
+    controller.WalkTarget = nil
+    if ok then
+        controller.Statistics.walks += 1
+        say('OK', '%s reached %s. Interaction/reward remains UNVERIFIED.', feature, label)
+    else
+        controller.Statistics.failed += 1
+        say('WARN', '%s movement failed: %s', feature, tostring(note))
+    end
+    return true -- a movement attempt was made
+end
+
+local function progressionWatch(state)
+    local p = state.Progress
+    local serial = tostring(p.Stage) .. '|' .. tostring(p.Kills) .. '|' .. tostring(p.Rebirths)
+    logChange('progress', serial, 'Progress Stage=%s Kills=%s Rebirths=%s',
+        tostring(p.Stage), tostring(p.Kills), tostring(p.Rebirths))
+end
+
+local function orbTracker(state)
+    local orb, dist, count = scanNearest(orbFolder(), state.Position, CONFIG.MaxOrbDistance,
+        function(inst) return inst.Name == 'Orb' and inst:IsA('BasePart') end)
+    state.Orb, state.OrbDistance, state.OrbCount = orb, dist, count
+    if orb then uniqueId(orb) end
+    logChange('orbs', count, 'Visible Orb parts=%d | nearest=%s', count,
+        orb and string.format('%.1f studs', dist) or 'none within search radius')
+end
+
+local function critterTargetHint(state)
+    local enemy, dist, count = scanNearest(critterFolder(), state.Position, CONFIG.MaxCritterDistance,
+        function(inst) return inst:IsA('Model') end)
+    state.Critter, state.CritterDistance, state.CritterCount = enemy, dist, count
+    if enemy then uniqueId(enemy) end
+    logChange('critters', (enemy and uniqueId(enemy) or 'none'),
+        'Nearby critter candidate: %s | dist=%s | listed models=%d (hostility/HP NOT verified)',
+        enemy and enemy.Name or 'none', enemy and string.format('%.1f', dist) or '-', count)
+end
+
+local function lowHealthAdvisor(state)
+    if state.Health == nil or not state.MaxHealth or state.MaxHealth <= 0 then return end
+    local low = state.Health / state.MaxHealth <= CONFIG.LowHealthRatio
+    logChange('health_warning', low, 'HP %.0f/%.0f -> %s',
+        state.Health, state.MaxHealth, low and 'LOW: manual retreat recommended' or 'normal')
+    state.LowHealth = low
+end
+
+local function lostEggTracker(state)
+    local egg, distance, count = scanNearest(eggFolder(), state.Position, CONFIG.MaxEggDistance,
+        function(inst) return inst.Name:match('^Egg_%d+$') and inst:IsA('BasePart') end)
+    state.Egg, state.EggDistance, state.EggCount = egg, distance, count
+    local label = egg and (egg.Name .. ':' .. string.format('%.1f', distance)) or 'none'
+    logChange('egg_candidate', label, 'LostEggs visible=%d | nearest=%s (claimed status NOT verified)',
+        count, label)
+end
+
+local function zoneHint(state)
+    local nearest, dist, count = scanNearest(gateFolder(), state.Position, CONFIG.MaxTravelDistance,
+        function(inst) return inst:IsA('Model') or inst:IsA('BasePart') end)
+    state.NearestGate, state.NearestGateDistance, state.Gates = nearest, dist, count
+    if nearest then
+        logChange('gate', uniqueId(nearest), 'Nearest gate candidate=%s (%.1f studs); gate access unverified',
+            nearest.Name, dist)
+    end
+end
+
+-- Deterministic, conditional advisers: NEVER invent missing pricing/quest/rebirth state.
+local function questHelper(state)
+    local q = readAdapter('quest_helper', state)
+    if type(q) ~= 'table' then return end
+    if q.summary then logChange('quests', tostring(q.summary), 'Quests: %s', tostring(q.summary)) end
+end
+
+local function upgradeAdvisor(state)
+    local data = readAdapter('upgrade_advisor', state)
+    if type(data) ~= 'table' or type(data.options) ~= 'table' then return end
+    local best, score = nil, -math.huge
+    for _, option in ipairs(data.options) do
+        if type(option.cost) == 'number' and option.cost > 0
+            and type(option.gain) == 'number' and option.affordable == true then
+            local candidate = option.gain / option.cost
+            if candidate > score then best, score = option, candidate end
+        end
+    end
+    if best and best.id then
+        logChange('upgrade_advisor', tostring(best.id),
+            'Upgrade suggestion %s (gain / cost = %.3f; assumes comparable effect)',
+            tostring(best.id), score)
+    end
+end
+
+local function evolveAssistant(state)
+    local data = readAdapter('evolve_assistant', state)
+    if type(data) ~= 'table' then return end
+    local key = tostring(data.eligible) .. '|' .. tostring(data.nextStage)
+    logChange('evolve', key, 'Evolution next=%s, eligible=%s, missing=%s',
+        tostring(data.nextStage), tostring(data.eligible), tostring(data.missing))
+end
+
+local function petManager(state)
+    local data = readAdapter('pet_manager', state)
+    if type(data) ~= 'table' then return end
+    local key = tostring(data.summary)
+    if data.summary then logChange('pet', key, 'Pets: %s', key) end
+end
+
+local function mutationManager(state)
+    local data = readAdapter('mutation_manager', state)
+    if type(data) ~= 'table' then return end
+    if data.summary then
+        logChange('mutation', tostring(data.summary), 'Mutation: %s', tostring(data.summary))
+    end
+end
+
+local function rebirthAdvisor(state)
+    local data = readAdapter('rebirth_advisor', state)
+    if type(data) ~= 'table' then return end
+    if data.eligible ~= nil then
+        local msg = tostring(data.eligible) .. '|' .. tostring(data.cost)
+        logChange('rebirth', msg, 'Rebirth eligible=%s | cost/reset=%s (do NOT reset automatically)',
+            tostring(data.eligible), tostring(data.cost))
+    end
+end
+
+local function eventAssistant(state)
+    local data = readAdapter('event_assistant', state)
+    if type(data) ~= 'table' then return end
+    if data.summary then
+        logChange('event', tostring(data.summary), 'Event: %s', tostring(data.summary))
+    end
+end
+
+-- Local movement-only candidate assistants; no guessed Remote calls or fake pickup.
+local function tryApproachOrb(state)
+    if not canWalk('orb_auto_collect') then return false end
+    local target = scanNearest(orbFolder(), state.Position, CONFIG.MaxOrbDistance,
+        function(inst)
+            return inst.Name == 'Orb' and inst:IsA('BasePart')
+                and controller.SeenOrbs[inst] ~= true
+        end)
+    if not target then return false end
+    local point = positionOf(target)
+    if point and (point - state.Position).Magnitude <= 5 then
+        controller.SeenOrbs[target] = true
+        return false -- already nearby, select another Orb next tick
+    end
+    local attempted = walkCandidate('orb_auto_collect', target, 'Orb '..uniqueId(target))
+    if attempted then
+        local cs = characterState()
+        local pos = positionOf(target)
+        if cs and pos and (cs.Position - pos).Magnitude <= 5 then
+            controller.SeenOrbs[target] = true
+            say('INFO', 'Visited Orb %s. No confirmed pickup or server reward.', uniqueId(target))
+        end
+    end
+    return attempted
+end
+
+local function tryVisitEgg(state)
+    if not canWalk('lost_egg_auto_visit') then return false end
+    local folder = eggFolder()
+    if not folder then return false end
+    local nearest = scanNearest(folder, state.Position, CONFIG.MaxEggDistance,
+        function(inst)
+            return inst:IsA('BasePart') and inst.Name:match('^Egg_%d+$')
+                and controller.SeenEggs[inst.Name] ~= true
+        end)
+    if not nearest then return false end
+    local attempted = walkCandidate('lost_egg_auto_visit', nearest, nearest.Name)
+    -- "Seen" means physically visited, never "collected" or "claimed".
+    if attempted then
+        local cs = characterState()
+        local point = positionOf(nearest)
+        if cs and point and (cs.Position - point).Magnitude <= 5 then
+            controller.SeenEggs[nearest.Name] = true
+            say('INFO', 'Visited %s; egg reward/claim not verified', nearest.Name)
+        end
+    end
+    return attempted
+end
+
+local function tryNavigateGate(state)
+    if not canWalk('zone_navigation') then return false end
+    local folder = gateFolder()
+    if not folder then return false end
+    local gate = folder:FindFirstChild(CONFIG.TargetZoneGate)
+    if not gate then
+        logChange('missing_gate', CONFIG.TargetZoneGate, 'Gate missing: %s', CONFIG.TargetZoneGate)
+        return false
+    end
+    return walkCandidate('zone_navigation', gate, CONFIG.TargetZoneGate)
+end
+
+-- Registered feature handlers. Each feature has a meaningful decision/observation path.
+-- Automatic action handlers never call guessed game Remotes.
+local handlers = {
+    progression_watch = progressionWatch,
+    orb_tracker = orbTracker,
+    combat_target_hint = critterTargetHint,
+    combat_retreat = lowHealthAdvisor,
+    lost_egg_tracker = lostEggTracker,
+    zone_navigation = zoneHint,
+    quest_helper = questHelper,
+    upgrade_advisor = upgradeAdvisor,
+    evolve_assistant = evolveAssistant,
+    pet_manager = petManager,
+    mutation_manager = mutationManager,
+    rebirth_advisor = rebirthAdvisor,
+    event_assistant = eventAssistant,
+}
+
+-- Conditional action categories; adapter Plan validates the game-specific preconditions.
+local actionOrder = {
+    'orb_auto_collect',
+    'lost_egg_auto_visit',
+    'zone_navigation',
+    'combat_auto_bite',
+    'ability_scheduler',
+    'daily_claim',
+    'upgrade_autobuy',
+    'evolve_auto',
+    'pet_hatch_fuse',
+    'mutation_automatic',
+    'rebirth_automatic',
+}
+
+local function runObservations(state)
+    -- Dependencies: moving toward an orb/egg/gate needs a fresh target snapshot.
+    if featureOn('orb_tracker') or featureOn('orb_auto_collect') then
+        attempt('orb_tracker', orbTracker, state)
+    end
+    if featureOn('lost_egg_tracker') or featureOn('lost_egg_auto_visit') then
+        attempt('lost_egg_tracker', lostEggTracker, state)
+    end
+    if featureOn('zone_navigation') then attempt('zone_navigation_observe', zoneHint, state) end
+    for name, handler in pairs(handlers) do
+        if name ~= 'orb_tracker' and name ~= 'lost_egg_tracker' and name ~= 'zone_navigation'
+            and featureOn(name) then
+            attempt(name, handler, state)
+        end
+    end
+    -- Safety check may not depend on whether user enabled notifications.
+    if state.Health ~= nil and state.MaxHealth and state.MaxHealth > 0 then
+        state.LowHealth = state.Health / state.MaxHealth <= CONFIG.LowHealthRatio
+    end
+end
+
+local function runActions(state)
+    if not state.Alive or state.LowHealth then return end
+    for _, feature in ipairs(actionOrder) do
+        local acted = false
+        if feature == 'orb_auto_collect' then
+            acted = attempt('orb_walk', tryApproachOrb, state) == true
+        elseif feature == 'lost_egg_auto_visit' then
+            acted = attempt('egg_walk', tryVisitEgg, state) == true
+        elseif feature == 'zone_navigation' then
+            acted = attempt('gate_walk', tryNavigateGate, state) == true
+        elseif CONFIG.EnableActions and canPerform(feature) then
+            acted = adapterAction(feature, state)
+        end
+        if acted then break end
+    end
+end
+
+function controller:Stop(reason)
+    if not self.Running then return end
+    self.Running = false
+    CONFIG.EnableMovement = false
+    CONFIG.EnableActions = false
+    for _, connection in ipairs(self.Connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    local c = characterState()
+    if c and c.Humanoid then
+        pcall(function() c.Humanoid:MoveTo(c.Position) end)
+    end
+    say('STOP', '%s | ticks=%d, attempted=%d, verified=%d, failed=%d',
+        tostring(reason or 'manual stop'), self.Statistics.ticks,
+        self.Statistics.actions, self.Statistics.verified, self.Statistics.failed)
+end
+
+function controller:GetFeatureSummary()
+    local list = {}
+    for feature, enabled in pairs(CONFIG.Features) do
+        table.insert(list, {name=feature, enabled=enabled, blocked=self.Blocked[feature] == true})
+    end
+    table.sort(list, function(a,b) return a.name < b.name end)
+    return list
+end
+
+local adapterOnly = {
+    combat_auto_bite = true, ability_scheduler = true, daily_claim = true,
+    upgrade_autobuy = true, evolve_auto = true, pet_hatch_fuse = true,
+    mutation_automatic = true, rebirth_automatic = true,
+}
+
+function controller:SetFeature(name, enabled)
+    if not self.Running then return false, 'Controller already stopped (re-run script)' end
+    if CONFIG.Features[name] == nil or name == 'all_game_autoplay' then
+        return false, 'Unknown/unsupported feature'
+    end
+    if enabled == true and adapterOnly[name] and not hasFullAdapter() then
+        return false, 'Unverified game adapter. Feature not runnable yet.'
+    end
+    CONFIG.Features[name] = (enabled == true)
+    if not enabled and self.WalkTarget and (name == 'orb_auto_collect' or
+        name == 'lost_egg_auto_visit' or name == 'zone_navigation') then
+        local cs = characterState()
+        if cs and cs.Humanoid then cs.Humanoid:MoveTo(cs.Position) end
+    end
+    return true
+end
+
+function controller:SetMovementEnabled(enabled)
+    if not self.Running then return false, 'Controller already stopped (re-run script)' end
+    CONFIG.EnableMovement = (enabled == true)
+    if not CONFIG.EnableMovement then
+        local cs = characterState()
+        if cs and cs.Humanoid then cs.Humanoid:MoveTo(cs.Position) end
+    end
+    say('INFO', 'Humanoid movement assistant=%s', tostring(CONFIG.EnableMovement))
+    return true
+end
+
+function controller:SetGateTarget(target)
+    local valid = {Garden='Gate_Garden', Hollow='Gate_Hollow', Picnic='Gate_Picnic'}
+    if not valid[target] then return false, 'Unknown destination' end
+    CONFIG.TargetZoneGate = valid[target]
+    say('INFO', 'Gate target=%s', CONFIG.TargetZoneGate)
+    return true
+end
+
+function controller:SetActionsEnabled(enabled)
+    if enabled and not hasFullAdapter() then
+        return false, 'No complete verified game adapter'
+    end
+    CONFIG.EnableActions = enabled == true
+    return true
+end
+
+-- F8 stops without creating any UI.
+table.insert(controller.Connections, UserInputService.InputBegan:Connect(function(input, processed)
+    if input.KeyCode == CONFIG.EmergencyStopKey then
+        controller:Stop('F8 emergency stop')
+    end
+end))
+
+say('BOOT', 'Engine initialized (optional Key Hub UI) | PlaceId=%s | read-only=%s',
+    tostring(game.PlaceId), tostring(not CONFIG.EnableActions))
+say('BOOT', 'Known paths: ClientOrbs, Ants.Critters, Game.LostEggs, Game.Gates')
+say('BOOT', 'Built-in actions: Humanoid MoveTo only; no game Remotes called. Full Auto Play UNVERIFIED. F8=STOP')
+
+-- Polling avoids a full Workspace scan of ~84,000 Instance records per tick.
+task.spawn(function()
+    local lastReport = 0
+    while controller.Running do
+        local cs = characterState()
+        if cs then
+            controller.Statistics.ticks += 1
+            local state = {
+                Position = cs.Position,
+                Root = cs.Root,
+                Humanoid = cs.Humanoid,
+                Health = cs.Health,
+                MaxHealth = cs.MaxHealth,
+                Alive = cs.Alive,
+                Progress = progress(),
+            }
+            runObservations(state)
+            runActions(state)
+            controller.Cache = {
+                UpdatedAt = os.clock(),
+                Progress = state.Progress,
+                OrbCount = state.OrbCount,
+                CritterCount = state.CritterCount,
+                EggCount = state.EggCount,
+                LowHealth = state.LowHealth,
+            }
+            if os.clock() - lastReport >= CONFIG.ReportSeconds then
+                lastReport = os.clock()
+                say('STATUS', 'Orbs=%s Critters=%s Eggs=%s | walk=%d action attempts=%d verified=%d failed=%d',
+                    tostring(state.OrbCount), tostring(state.CritterCount), tostring(state.EggCount),
+                    controller.Statistics.walks, controller.Statistics.actions, controller.Statistics.verified, controller.Statistics.failed)
+            end
+        else
+            logChange('character', 'missing', 'No character/root; waiting for respawn')
+        end
+        task.wait(CONFIG.TickSeconds)
+    end
+end)
+
+-- ============================================================================
+-- KEY HUB: UI goc da co Home / Tinh nang / Player / Settings.
+-- Dang ky control vao tab Tinh nang qua API moi. KHONG TAO WINDOW / TAB.
+-- ============================================================================
+do
+    local SharedUI = nil
+    if type(UI) == 'table' then
+        SharedUI = UI
+    elseif type(env.UI) == 'table' then
+        SharedUI = env.UI
+    end
+
+    if SharedUI and type(SharedUI.AddToggle) == 'function' then
+        local registered = 0
+        local ok, err = pcall(function()
+            local function addToggle(label, feature)
+                SharedUI.AddToggle({
+                    Name = label,
+                    Default = CONFIG.Features[feature] == true,
+                    Callback = function(value)
+                        local success, reason = controller:SetFeature(feature, value)
+                        if success then
+                            say('UI', '%s = %s', feature, tostring(value == true))
+                        else
+                            warn('[RUM][UI] '..feature..': '..tostring(reason))
+                        end
+                    end,
+                })
+                registered += 1
+            end
+
+            -- Only directly runnable observation features are always registered.
+            addToggle('Theo doi Stage / Kills / Rebirth', 'progression_watch')
+            addToggle('Theo doi Orb', 'orb_tracker')
+            addToggle('Quan sat Critter', 'combat_target_hint')
+            addToggle('Canh bao HP thap', 'combat_retreat')
+            addToggle('Tim 20 Lost Eggs', 'lost_egg_tracker')
+
+            SharedUI.AddToggle({
+                Name = 'Cho phep di bo MoveTo (khong teleport)',
+                Default = false,
+                Callback = function(value)
+                    controller:SetMovementEnabled(value)
+                end,
+            })
+            registered += 1
+
+            -- Action label explicitly says WALK ONLY; does not promise collected rewards.
+            addToggle('Tu DI BO toi Orb (chua xac minh nhat)', 'orb_auto_collect')
+            addToggle('Tu DI BO tham Lost Eggs', 'lost_egg_auto_visit')
+            addToggle('Tu DI BO toi cong da chon', 'zone_navigation')
+
+            if type(SharedUI.AddDropdown) == 'function' then
+                SharedUI.AddDropdown({
+                    Name = 'Cong dich den',
+                    Options = {'Garden','Hollow','Picnic'},
+                    Default = 'Garden',
+                    Callback = function(choice)
+                        local good, why = controller:SetGateTarget(choice)
+                        if not good then warn('[RUM][UI] '..tostring(why)) end
+                    end,
+                })
+                registered += 1
+            end
+            if type(SharedUI.AddSlider) == 'function' then
+                SharedUI.AddSlider({
+                    Name = 'Khoang cach di toi da (studs)',
+                    Min = 20, Max = 300, Default = CONFIG.MaxTravelDistance,
+                    Callback = function(value)
+                        local v = tonumber(value)
+                        if v then CONFIG.MaxTravelDistance = math.clamp(v, 20, 300) end
+                    end,
+                })
+                registered += 1
+                SharedUI.AddSlider({
+                    Name = 'HP canh bao (%)',
+                    Min = 5, Max = 90, Default = math.floor(CONFIG.LowHealthRatio * 100),
+                    Callback = function(value)
+                        local v = tonumber(value)
+                        if v then CONFIG.LowHealthRatio = math.clamp(v, 5, 90) / 100 end
+                    end,
+                })
+                registered += 1
+            end
+
+            -- Only expose game-action toggles when an authorized implementation exists.
+            if hasFullAdapter() then
+                addToggle('Auto Bite PvE - adapter', 'combat_auto_bite')
+                addToggle('Ability Scheduler - adapter', 'ability_scheduler')
+                addToggle('Nhan thuong - adapter', 'daily_claim')
+                addToggle('Auto Upgrade - adapter', 'upgrade_autobuy')
+                addToggle('Auto Evolve - adapter', 'evolve_auto')
+                addToggle('Pet Hatch / Fuse - adapter', 'pet_hatch_fuse')
+                addToggle('Mutation - adapter', 'mutation_automatic')
+                addToggle('Auto Rebirth - adapter', 'rebirth_automatic')
+                for _, feat in ipairs({'quest_helper','upgrade_advisor','evolve_assistant',
+                    'pet_manager','mutation_manager','rebirth_advisor','event_assistant'}) do
+                    addToggle('Theo doi '..feat, feat)
+                end
+                if type(SharedUI.AddToggle) == 'function' then
+                    SharedUI.AddToggle({
+                        Name = 'Cho phep hanh dong adapter da xac minh',
+                        Default = false,
+                        Callback = function(v)
+                            local good, why = controller:SetActionsEnabled(v)
+                            if not good then warn('[RUM][UI] '..tostring(why)) end
+                        end,
+                    })
+                    registered += 1
+                    SharedUI.AddToggle({
+                        Name = 'Adapter: cho phep tieu tai nguyen',
+                        Default = false,
+                        Callback = function(v) CONFIG.AllowResourceSpending = v == true end,
+                    })
+                    registered += 1
+                    SharedUI.AddToggle({
+                        Name = 'Adapter: cho phep Rebirth',
+                        Default = false,
+                        Callback = function(v) CONFIG.AllowRebirth = v == true end,
+                    })
+                    registered += 1
+                end
+            else
+                say('WARN', 'Combat / quests / upgrade / pet / mutation / rebirth missing verified adapter; controls not shown')
+            end
+
+            if type(SharedUI.AddButton) == 'function' then
+                SharedUI.AddButton({
+                    Name = 'In trang thai RUM ra Output',
+                    Callback = function()
+                        say('STATUS', 'running=%s movement=%s adapterAction=%s | ticks=%d walks=%d attempted=%d verified=%d failed=%d',
+                            tostring(controller.Running), tostring(CONFIG.EnableMovement),
+                            tostring(CONFIG.EnableActions), controller.Statistics.ticks,
+                            controller.Statistics.walks, controller.Statistics.actions,
+                            controller.Statistics.verified, controller.Statistics.failed)
+                        for _, row in ipairs(controller:GetFeatureSummary()) do
+                            if row.enabled then say('STATUS', '%s enabled blocked=%s', row.name, tostring(row.blocked)) end
+                        end
+                    end,
+                })
+                registered += 1
+                SharedUI.AddButton({
+                    Name = 'DUNG KHAN CAP - F8',
+                    Callback = function() controller:Stop('Key Hub button') end,
+                })
+                registered += 1
+            end
+            say('UI', 'Registered %d controls into existing Tinh nang tab (AddToggle API)', registered)
+        end)
+        if not ok then warn('[RUM][UI] Register failed: '..tostring(err)) end
+    else
+        say('INFO', 'UI.AddToggle missing; running NoUI mode (F8/Controller available)')
+    end
+end
