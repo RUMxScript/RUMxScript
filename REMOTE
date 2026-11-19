@@ -1,0 +1,114 @@
+-- Remote Logger v3 (chỉ ghi lại, không tự gửi remote)
+local USE_NAMECALL_HOOK = false  -- chỉ bật true trên Delta/Volt
+
+local G = (getgenv and getgenv()) or _G
+local function pick(...) for i=1,select("#",...) do local f=select(i,...) if type(f)=="function" then return f end end end
+local X = {
+    hookmeta = pick(hookmetamethod), getncm = pick(getnamecallmethod),
+    checkcaller = pick(checkcaller), newcc = pick(newcclosure) or function(f) return f end,
+    writefile = pick(writefile), appendfile = pick(appendfile),
+    makefolder = pick(makefolder), isfolder = pick(isfolder),
+    clipboard = pick(setclipboard, toclipboard),
+}
+local RS = game:GetService("ReplicatedStorage")
+local RemotesFolder = RS:WaitForChild("Remotes")
+
+local FILE = "ThrowScan/remotelog_v3_" .. os.time() .. ".txt"
+pcall(function()
+    if X.makefolder and not (X.isfolder and X.isfolder("ThrowScan")) then X.makefolder("ThrowScan") end
+    if X.writefile then X.writefile(FILE, "") end
+end)
+local logs = {}
+local function log(s)
+    print(s); logs[#logs+1] = s
+    if X.appendfile then pcall(X.appendfile, FILE, s .. "\n") end
+end
+
+local function short(v)
+    if typeof(v) ~= "Instance" then return tostring(v) end
+    local ok, n = pcall(function() return v:GetFullName() end)
+    return ok and (n:gsub("^ReplicatedStorage%.Remotes%.", "")) or tostring(v)
+end
+local function ser(v, d)
+    d = d or 0
+    local t = typeof(v)
+    if t == "string" then return string.format("%q", v)
+    elseif t == "Instance" then return "<" .. v.ClassName .. "> " .. short(v)
+    elseif t == "Vector3" then return string.format("Vector3.new(%.2f,%.2f,%.2f)", v.X, v.Y, v.Z)
+    elseif t == "CFrame" then local p = v.Position return string.format("CFrame.new(%.2f,%.2f,%.2f)", p.X, p.Y, p.Z)
+    elseif t == "function" then return "function"
+    elseif t == "table" then
+        if d > 3 then return "{...}" end
+        local p = {}
+        for k, x in pairs(v) do p[#p+1] = "[" .. ser(k, d+1) .. "]=" .. ser(x, d+1) end
+        return "{" .. table.concat(p, ", ") .. "}"
+    end
+    return tostring(v)
+end
+local function argStr(t, from)
+    local a = {}
+    for i = from or 1, t.n do a[#a+1] = ser(t[i]) end
+    return table.concat(a, ", ")
+end
+
+-- Bỏ qua remote spam
+local NOISE = { Data = true, ["Analytics"] = true, Leaderboards = true }
+local function noisy(name) name = tostring(name) return NOISE[name] or NOISE[name:match("^([^%.]+)") or ""] end
+
+G.RLog = true
+
+-------------------------------------------------------------
+-- A) Hook module Shared.Remotes (Lua thuần, mọi executor)
+-------------------------------------------------------------
+local ok, R = pcall(require, RS:WaitForChild("Shared"):WaitForChild("Remotes"))
+if ok and type(R) == "table" then
+    for _, fname in ipairs({ "Invoke", "Fire", "Send", "Function", "Event", "Get" }) do
+        local orig = rawget(R, fname)
+        if type(orig) == "function" then
+            R[fname] = function(...)
+                local args = table.pack(...)
+local res = table.pack(orig(...))
+                if G.RLog then
+                    local tag = ser(args[1])
+                    if not noisy(args[1]) and fname ~= "Get" and fname ~= "Function" and fname ~= "Event" then
+                        log(string.format("[%s] >> Remotes.%s(%s)  ==> %s",
+                            os.date("%X"), fname, argStr(args), argStr(res)))
+                    elseif fname == "Function" or fname == "Event" or fname == "Get" then
+                        log(string.format("[%s] .. Remotes.%s(%s)", os.date("%X"), fname, argStr(args)))
+                    end
+                end
+                return table.unpack(res, 1, res.n)
+            end
+        end
+    end
+    print("[RLog] Hook module Shared.Remotes OK")
+else
+    warn("[RLog] Không require được Shared.Remotes: " .. tostring(R))
+end
+
+-------------------------------------------------------------
+-- B) Hook __namecall (tùy chọn, chỉ log, không chặn)
+-------------------------------------------------------------
+if USE_NAMECALL_HOOK and X.hookmeta and X.getncm then
+    local old
+    old = X.hookmeta(game, "__namecall", X.newcc(function(self, ...)
+        if G.RLog and not (X.checkcaller and X.checkcaller()) then
+            local m = X.getncm()
+            if (m == "FireServer" or m == "InvokeServer") and typeof(self) == "Instance" then
+                local args = table.pack(...)
+                local name = short(self)
+                if not noisy(name) then
+                    task.spawn(log, string.format("[%s] >> %s:%s(%s)", os.date("%X"), name, m, argStr(args)))
+                end
+            end
+        end
+        return old(self, ...)
+    end))
+    print("[RLog] Hook __namecall OK")
+end
+
+-------------------------------------------------------------
+-- C) Server -> Client (bỏ Data vì spam mỗi giây)
+-------------------------------------------------------------
+for _, r in ipairs(RemotesFolder:GetDescendants()) do
+    if (r:IsA("RemoteEvent") or r:IsA("UnreliableRemoteEvent")) and n
