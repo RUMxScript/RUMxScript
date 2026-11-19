@@ -207,8 +207,8 @@ local header=create("Frame",main,{
 local brand=create("Frame",header,{Position=UDim2.fromOffset(16,15),Size=UDim2.fromOffset(33,33),BackgroundColor3=PALETTE.greenDark,BorderSizePixel=0})
 corner(brand,9)
 textLabel(brand,"R",UDim2.fromScale(0,0),UDim2.fromScale(1,1),{TextSize=20,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Center})
-textLabel(header,"RUM / Gameplay Scanner",UDim2.fromOffset(60,11),UDim2.new(1,-160,0,25),{Font=Enum.Font.GothamBold,TextSize=19})
-textLabel(header,"GAMEPLAY  /  v6.1  /  Debug",UDim2.fromOffset(61,35),UDim2.new(1,-145,0,17),{TextSize=11,TextColor3=PALETTE.muted})
+textLabel(header,"RUM / Gameplay Scanner",UDim2.fromOffset(60,11),UDim2.new(1,-260,0,25),{Font=Enum.Font.GothamBold,TextSize=19})
+textLabel(header,"GAMEPLAY  /  v6.1  /  Debug",UDim2.fromOffset(61,35),UDim2.new(1,-260,0,17),{TextSize=11,TextColor3=PALETTE.muted})
 local closeBtn=button(header,"×",UDim2.new(1,-46,0,16),UDim2.fromOffset(30,30),PALETTE.subpanel)
 closeBtn.TextSize=20
 local scanPanel=create("Frame",main,{Position=UDim2.fromOffset(16,64),Size=UDim2.new(1,-32,0,64),BackgroundColor3=PALETTE.panel,BorderSizePixel=0})
@@ -3246,6 +3246,96 @@ do
 end
 on(txtBtn.MouseButton1Click,function() exportNow("txt") end)
 on(jsonBtn.MouseButton1Click,function() exportNow("json") end)
+
+-- EXPORT ALL: only already-retained RUM reports, using the original exporters.
+-- No new collection, external tool access, or permission changes.
+do
+    txtBtn.Size=UDim2.new(1/3,-14,0,40)
+    jsonBtn.Position=UDim2.new(1/3,4,1,-94)
+    jsonBtn.Size=UDim2.new(1/3,-8,0,40)
+    local allBtn=button(main,"EXPORT ALL",UDim2.new(2/3,4,1,-94),UDim2.new(1/3,-20,0,40),PALETTE.greenDark)
+    on(allBtn.MouseButton1Click,function()
+        if busy or closed then return end
+        if #histories==0 then updateStatus("Chưa có báo cáo RUM để xuất.",true);return end
+        if type(writefile)~="function" then updateStatus("Không có hỗ trợ ghi file.",true);return end
+        busy=true
+        allBtn.Text="ĐANG XUẤT..."
+        scanBtn.Text="ĐANG XUẤT..."
+        local retained={}
+        for i,snap in ipairs(histories) do retained[i]=snap end
+        task.spawn(function()
+            local good,err=xpcall(function()
+                local manifest={schema="RUM_EXPORT_ALL_V1",scope="retained_RUM_reports_only",startedAt=os.date("!%Y-%m-%dT%H:%M:%SZ"),retainedScans=#retained,completedScans=sequence,historyLimit=MAX_HISTORY,recordBudget=HISTORY_RECORD_BUDGET,files={},success=0,failed=0,unverified=0,expectedFiles=#retained*2,note="No external tool data. Previously evicted scans and data never collected are not included."}
+                for _,snap in ipairs(retained) do
+                    for _,ext in ipairs({"json","txt"}) do
+                        if closed then return end
+                        local ran,ok,path,diag=xpcall(function() return saveAsSingleFile(snap,ext,"full") end,scannerTrace)
+                        if not ran then path=tostring(ok);ok=false end
+                        local row={scan=snap.sequence,format=ext,ok=ok==true}
+                        if ok then
+                            row.path=path;row.diagnostics=diag
+                            manifest.success=manifest.success+1
+                            if not diag or diag.verification~="size_and_footer_checked" then manifest.unverified=manifest.unverified+1 end
+                        else
+                            row.error=tostring(path);manifest.failed=manifest.failed+1
+                        end
+                        manifest.files[#manifest.files+1]=row
+                        log(ok and "INFO" or "ERROR",("Export ALL #%s %s: %s"):format(tostring(snap.sequence),ext,tostring(path)))
+                        setProgress(#manifest.files,manifest.expectedFiles)
+                        task.wait()
+                    end
+                end
+                if closed then return end
+                manifest.status=manifest.failed>0 and "partial_failure" or (manifest.unverified>0 and "written_not_fully_checked" or "all_retained_reports_written")
+                local encode=makeJsonEncoder()
+                local bytes=encode(manifest)
+                local stem=("RUM_EXPORT_ALL_%s_%d"):format(os.date("!%Y%m%d_%H%M%S"),math.floor(os.clock()*1000))
+                local name=stem..".json"
+                if type(isfile)=="function" then
+                    local i=1
+                    while isfile(name) do name=stem.."_"..i..".json";i=i+1 end
+                end
+                writefile(name,bytes)
+                if type(readfile)=="function" and readfile(name)~=bytes then error("Manifest readback mismatch") end
+                lastSaved=name
+                updateStatus(("Export ALL: %d/%d file, %d lỗi, %d chưa kiểm tra; %s"):format(manifest.success,manifest.expectedFiles,manifest.failed,manifest.unverified,name),manifest.failed>0)
+            end,scannerTrace)
+            if closed then return end
+            busy=false
+            allBtn.Text="EXPORT ALL"
+            scanBtn.Text="QUÉT LẠI"
+            if not good then log("ERROR","Export ALL: "..tostring(err));updateStatus("Export ALL lỗi. Xem Debug; các file đã ghi vẫn được giữ.",true) end
+        end)
+    end)
+end
+
+
+-- Window visibility only: keep all scanner state and active tasks intact.
+do
+    local minimizeBtn=button(header,"−",UDim2.new(1,-188,0,16),UDim2.fromOffset(30,30),PALETTE.subpanel)
+    minimizeBtn.Name="MinimizeWindow"
+    minimizeBtn.TextSize=20
+    local reopenBtn=button(screen,"R",UDim2.new(1,-16,0,16),UDim2.fromOffset(38,38),PALETTE.greenDark)
+    reopenBtn.Name="RestoreWindow"
+    reopenBtn.TextSize=22
+    reopenBtn:FindFirstChildOfClass("UICorner").CornerRadius=UDim.new(0,10)
+    reopenBtn.AnchorPoint=Vector2.new(1,0)
+    reopenBtn.Visible=false
+    create("UIStroke",reopenBtn,{Color=PALETTE.border,Thickness=1})
+    on(minimizeBtn.MouseButton1Click,function()
+        if closed then return end
+        dragging=false
+        main.Visible=false
+        reopenBtn.Visible=true
+    end)
+    on(reopenBtn.MouseButton1Click,function()
+        if closed then return end
+        reopenBtn.Visible=false
+        main.Visible=true
+        fitWindow()
+    end)
+end
+
 
 renderHistory()
 log("INFO","Khởi tạo Gameplay v6.1 Debug-only patch. Full / Compact Diagnostics / QA Optional. writefile="..tostring(type(writefile)=="function").."; appendfile="..tostring(type(appendfile)=="function"))
