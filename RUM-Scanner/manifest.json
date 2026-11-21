@@ -1,0 +1,72 @@
+{
+  "format": "RUM_PACKED_RELEASE_V1",
+  "version": "10.9",
+  "expectedSourceBytes": 1203331,
+  "sourceSha256": "2b2a98c36f3698ece06e905fe91f8a2df764377d3729df8cf21837e9108e98ac",
+  "encoding": "base64",
+  "compression": "lzw16",
+  "dictionaryLimit": 8192,
+  "encodedBytes": 1051728,
+  "parts": [
+    {
+      "file": "01.txt",
+      "bytes": 87644,
+      "sha256": "fc54dc7d7353c850de1321595e76d9c47e038f4184a051a3be2c3b4da4e4a009"
+    },
+    {
+      "file": "02.txt",
+      "bytes": 87644,
+      "sha256": "34ff178ae20bad073d76e3e06f8058b6fe9dd17a9279cf78d9ec50ac6d9799d6"
+    },
+    {
+      "file": "03.txt",
+      "bytes": 87644,
+      "sha256": "44961fbd780d0302a822cef6cb788db9dc8ece0342c552518e986e91599eb49c"
+    },
+    {
+      "file": "04.txt",
+      "bytes": 87644,
+      "sha256": "ab64321617040091e540152972d17e670f73e6128fcd796b1b452327f78bf09f"
+    },
+    {
+      "file": "05.txt",
+      "bytes": 87644,
+      "sha256": "0edbcbc9c1bb4d4d1342af4e4769f9ecb3b50dab212b65b80869b0acd2f935e9"
+    },
+    {
+      "file": "06.txt",
+      "bytes": 87644,
+      "sha256": "29b5e94ce3c3d534f5e9328975be3c3b5db60ead1078dacecc9d98eebb9f5db"
+    },
+    {
+      "file": "07.txt",
+      "bytes": 87644,
+      "sha256": "6d2953892757c57f5e211b9cf6ec1b99ddeceb11e5f05f4c3ae3eb4b41301a13"
+    },
+    {
+      "file": "08.txt",
+      "bytes": 87644,
+      "sha256": "324124aead06ebe1aa635d0c7ef760a745601abb1cba4b2252a0ef3084d98581"
+    },
+    {
+      "file": "09.txt",
+      "bytes": 87644,
+      "sha256": "58513bcfaf6e1d83c4c096809055accea34401f866cd1038479bb13c2a4c54b1"
+    },
+    {
+      "file": "10.txt",
+      "bytes": 87644,
+      "sha256": "726612670fa564ade9eaa7bfe59d0350630e41e0bd420becd91534969f124be5"
+    },
+    {
+      "file": "11.txt",
+      "bytes": 87644,
+      "sha256": "3db45ae2b9afa50bcf383b053938835d63b2306edfa0b3668c2ef6171e0a4ac9"
+    },
+    {
+      "file": "12.txt",
+      "bytes": 87644,
+      "sha256": "445fa67c07b645ddfe282135314be1570eeb608690d60eeed8cd2b6ef150f5de"
+    }
+  ]
+}
