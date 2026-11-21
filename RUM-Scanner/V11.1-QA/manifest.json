@@ -1,0 +1,74 @@
+{
+  "format": "RUM_PACKED_RELEASE_PARTED_V2",
+  "version": "11.1-qa-fix1",
+  "build": "QA - pending Roblox runtime acceptance",
+  "expectedSourceBytes": 1296515,
+  "sourceSha256": "405ebe041ea51ece38bd468ea60fc4b6b0022eadffdedbc49d843d069fd2348b",
+  "compression": "lzw16-per-part",
+  "encoding": "base64",
+  "dictionaryLimit": 8192,
+  "joinDelimiter": "\\n",
+  "encodedBytes": 1046984,
+  "parts": [
+    {
+      "file": "01.txt",
+      "bytes": 89904,
+      "sourceBytes": 100730
+    },
+    {
+      "file": "02.txt",
+      "bytes": 69020,
+      "sourceBytes": 94324
+    },
+    {
+      "file": "03.txt",
+      "bytes": 77032,
+      "sourceBytes": 103040
+    },
+    {
+      "file": "04.txt",
+      "bytes": 91492,
+      "sourceBytes": 110365
+    },
+    {
+      "file": "05.txt",
+      "bytes": 90008,
+      "sourceBytes": 116205
+    },
+    {
+      "file": "06.txt",
+      "bytes": 93232,
+      "sourceBytes": 114012
+    },
+    {
+      "file": "07.txt",
+      "bytes": 83256,
+      "sourceBytes": 110619
+    },
+    {
+      "file": "08.txt",
+      "bytes": 105384,
+      "sourceBytes": 130643
+    },
+    {
+      "file": "09.txt",
+      "bytes": 101088,
+      "sourceBytes": 121918
+    },
+    {
+      "file": "10.txt",
+      "bytes": 103496,
+      "sourceBytes": 125147
+    },
+    {
+      "file": "11.txt",
+      "bytes": 115480,
+      "sourceBytes": 135934
+    },
+    {
+      "file": "12.txt",
+      "bytes": 27592,
+      "sourceBytes": 33567
+    }
+  ]
+}
